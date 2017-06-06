@@ -81,6 +81,251 @@
 
 #include "utils.h"
 
+#include <cassert>
+
+template<typename T>
+struct addF {
+    __device__ T operator() (const T& a, const T& b) {
+        return a + b;
+    }
+};
+
+template<typename T>
+struct minF {
+    __device__ T operator() (const T& a, const T& b) {
+        return (a < b) ? a : b;
+    }
+};
+
+template<typename T>
+struct maxF {
+    __device__ T operator() (const T& a, const T& b) {
+        return (a < b) ? b : a;
+    }
+};
+
+template<typename T, typename F>
+__device__ T reduce_shared(T* sdata, int n) {
+    int tid = threadIdx.x;
+
+    for (int s = n/2; s>0; s /=2) {
+        if (tid < s) {
+            T a = sdata[tid];
+            T b = sdata[tid+s];
+            sdata[tid] = F()(a, b);
+        }
+        __syncthreads();
+    }
+
+    return sdata[0];
+}
+
+template<typename T, typename F>
+__global__ void reduce_kernel(const T* const d_in, T* const d_out, T identity, int length) {
+
+    int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+    int tid = threadIdx.x;
+    int n = blockDim.x;
+
+    extern __shared__ __align__(sizeof(T)) unsigned char smem[];
+    T *sdata = reinterpret_cast<T *>(smem); // size should be n
+
+    if (idx < length) {
+        sdata[tid] = d_in[idx];
+    } else {
+        sdata[tid] = identity;
+    }
+    if (idx + n < length) {
+        sdata[tid] = F()(sdata[tid], d_in[idx + n]);
+    }
+    __syncthreads();
+
+    T r = reduce_shared<T, F>(sdata, n);
+
+    if (tid == 0) {
+        d_out[blockIdx.x] = r;
+    }
+}
+
+__global__ void reduce_min_max_kernel(const float* const d_in, float* const d_min, float* const d_max, int length) {
+    
+    int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+    int tid = threadIdx.x;
+    int n = blockDim.x;
+
+    extern __shared__ __align__(sizeof(float)) unsigned char smem[];
+    float *sdata = reinterpret_cast<float *>(smem); // size should be n
+
+    float* sdata_min = sdata;
+    float* sdata_max = sdata + n;
+
+    if (idx < length) {
+        float t = d_in[idx];
+        sdata_min[tid] = t;
+        sdata_max[tid] = t;
+    } else {
+        sdata_min[tid] = 275.0;
+        sdata_max[tid] = 0.0;
+    }
+    if (idx + n < length) {
+        sdata_min[tid] = minF<int>()(sdata[tid], d_in[idx + n]);
+        sdata_max[tid] = maxF<int>()(sdata[tid], d_in[idx + n]);
+    }
+    __syncthreads();
+
+    for (int s = n/2; s>0; s /=2) {
+        if (tid < s) {
+            float a = sdata_min[tid];
+            float b = sdata_min[tid+s];
+            sdata_min[tid] = min(a, b);
+            
+            a = sdata_max[tid];
+            b = sdata_max[tid+s];
+            sdata_max[tid] = max(a, b);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        d_min[blockIdx.x] = sdata_min[0];
+        d_max[blockIdx.x] = sdata_max[0];
+    }
+}
+
+__global__ void histogram_local_reduce_atomic(const float* const d_logLuminance,
+                                                unsigned int* const d_histogram,
+                                                unsigned int* const d_buf, // numBins * length
+                                                const float min_logLum,
+                                                const float max_logLum,
+                                                const float range_logLum,
+                                                const size_t length,
+                                                const size_t numBins) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    int n = blockDim.x;
+
+    extern __shared__ __align__(sizeof(unsigned int)) unsigned char smem[];
+    unsigned int *sdata = reinterpret_cast<unsigned int *>(smem); // size should be n
+
+    for (int i=idx; i<length; i += gridDim.x * blockDim.x) {
+        int bin = (d_logLuminance[i] - min_logLum) / range_logLum * numBins;
+        d_buf[bin * length + idx] += 1;
+    }
+    __syncthreads();
+
+    for (int i=0; i<numBins; ++i) {
+        
+        sdata[tid] = d_buf[i * n + tid];
+        __syncthreads();
+        unsigned int r = reduce_shared< unsigned int, addF<unsigned int> >(sdata, n);
+        atomicAdd(&d_histogram[i], r);
+    }
+}
+
+template<typename T, typename F>
+__global__ void hills_steele_scan_kernel(const T* const d_in, T* const d_out, int length) {
+
+    int offset = blockIdx.x * blockDim.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+
+    int n = blockDim.x; // size of one shared mem array
+    int pin = 0, pout = 1;
+
+    extern __shared__ __align__(sizeof(T)) unsigned char smem[];
+    T *sdata = reinterpret_cast<T *>(smem); // size should be n
+
+    if (idx < length) {
+        sdata[tid] = d_in[idx];
+    }
+    __syncthreads();
+
+    for (int s = 1, pin = 0, pout = 1; s < blockDim.x; s <<= 1, pin = 1-pin, pout = 1-pout) {
+        if (tid >= s) {
+            T a = sdata[pin*n + tid - s];
+            T b = sdata[pin*n + tid];
+            sdata[pout*n + tid] = F()(a, b);
+        } else {
+            sdata[pout*n + tid] = sdata[pin*n + tid];
+        }
+        __syncthreads();
+    }
+
+    if (idx < length) {
+        d_out[idx] = sdata[tid];
+    }
+}
+
+template<typename T, typename F>
+__global__ void blelloch_scan_kernel(T* const d_in, T* const d_out, int length, T identity) {
+    
+    int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    int ltid = threadIdx.x;
+
+    int n = 2*blockDim.x;
+    
+    extern __shared__ __align__(sizeof(T)) unsigned char smem[];
+    T *sdata = reinterpret_cast<T *>(smem); // size should be n
+    
+    sdata[ltid * 2] = (gtid * 2 < length)? d_in[gtid * 2] : identity;
+    sdata[ltid * 2 + 1] = (gtid * 2 + 1< length)? d_in[gtid * 2] : identity;
+    __syncthreads();
+
+    int s = 2;
+    for (; s <= n; s <<= 1) {
+        int pos = ltid * s + s - 1;
+        if (pos < n) {
+            T a = sdata[pos - s/2];
+            T b = sdata[pos];
+            sdata[pos] = F()(a, b);
+        }
+        __syncthreads();
+    }
+
+    if (ltid == 0) {
+        d_out[blockIdx.x] = sdata[n-1];
+        sdata[n - 1] = identity; // identity item
+    }
+    __syncthreads();
+    
+    s = n;
+    for (; s > 1; s >>= 2) {
+        int pos = ltid * s + s - 1;
+        if (pos < n) {
+            T a = sdata[pos - s/2];
+            T b = sdata[pos];
+            sdata[pos] = F()(a, b);
+            sdata[pos - s/2] = b;
+        }
+        __syncthreads();
+    }
+    
+    if (gtid * 2 < length) {
+        d_in[gtid * 2] = sdata[ltid * 2];
+    }
+    if (gtid * 2 + 1 < length) {
+        d_in[gtid * 2 + 1] = sdata[ltid * 2 + 1];
+    }
+}
+
+template<typename T, typename F>
+__global__ void scan_update_kernel(T* const d_in, T* const d_buf, int length) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int idx = bid * blockDim.x + tid;
+
+    __shared__ T sdata;
+
+    if (tid == 0) {
+        sdata = d_buf[bid];
+    }
+    __syncthreads();
+
+    if (idx < length) {
+        d_in[idx] =  F()(d_in[idx], sdata);
+    }
+}
+
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
                                   float &min_logLum,
@@ -99,6 +344,55 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
+    int length = numRows * numCols;
 
+    int blockSize = 256;
+    int gridSize = (length + blockSize - 1)/blockSize;
+    
+    float* d_buf1;
+    unsigned int* d_buf2;
+    checkCudaErrors(cudaMalloc((void **)&d_buf1, length * sizeof(float)));
+    checkCudaErrors(cudaMalloc((void **)&d_buf2, numBins * length * sizeof(unsigned int)));
+    checkCudaErrors(cudaMemset(d_buf2, 0, numBins * length * sizeof(unsigned int)));
+   
+    // find min_logLum
+    reduce_kernel< float, minF<float> ><<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_logLuminance, d_buf1, 275.0, length);
+    checkCudaErrors(cudaGetLastError());
+
+    int gs = gridSize;
+    while(gs > 1) {
+        gs = (gs+blockSize-1)/blockSize;
+        reduce_kernel<float, minF<float> ><<<gs, blockSize, blockSize * sizeof(float)>>>(d_buf1, d_buf1, 275.0, gs);
+        checkCudaErrors(cudaGetLastError());
+    }
+
+    min_logLum = d_buf1[0];
+    
+    // find max logLum
+    reduce_kernel<float, maxF<float> ><<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_logLuminance, d_buf1, 0.0, length);
+    checkCudaErrors(cudaGetLastError());
+
+    gs = gridSize;
+    while(gs > 1) {
+        gs = (gs+blockSize-1)/blockSize;
+        reduce_kernel<float, maxF<float> ><<<gs, blockSize, blockSize * sizeof(float)>>>(d_buf1, d_buf1, 0.0, gs);
+        checkCudaErrors(cudaGetLastError());
+    }
+
+    max_logLum = d_buf1[0];
+
+    // compute histogram
+    gridSize = (length + blockSize - 1)/blockSize;
+    histogram_local_reduce_atomic<<<gridSize, blockSize, blockSize * sizeof(unsigned int)>>>(d_logLuminance, d_cdf, d_buf2, min_logLum, max_logLum, max_logLum - min_logLum, length, numBins);
+    checkCudaErrors(cudaGetLastError());
+
+    // exclusive scan to produce cdf
+    gridSize = (numBins + blockSize - 1)/blockSize;
+    assert(gridSize <= blockSize);
+    blelloch_scan_kernel<unsigned int, addF<unsigned int> ><<<gridSize, blockSize, blockSize * 2 * sizeof(unsigned int)>>>(d_cdf, d_buf2, numBins, 0);
+    checkCudaErrors(cudaGetLastError());
+    
+    scan_update_kernel<unsigned int, addF<unsigned int> ><<<1, blockSize>>>(d_cdf, d_buf2, numBins);
+    checkCudaErrors(cudaGetLastError());
 
 }
