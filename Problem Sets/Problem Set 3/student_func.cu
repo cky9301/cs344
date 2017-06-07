@@ -81,6 +81,13 @@
 
 #include "utils.h"
 
+#define DEBUG 0
+
+#if DEBUG == 1
+#include <sys/time.h>
+#endif
+
+#include <cstdio>
 #include <cassert>
 
 template<typename T>
@@ -116,8 +123,14 @@ __device__ T reduce_shared(T* sdata, int n) {
         }
         __syncthreads();
     }
-
-    return sdata[0];
+    
+    T r;
+    if (tid == 0) {
+        r = sdata[0];
+    } else {
+        r = 0;
+    }
+    return r;
 }
 
 template<typename T, typename F>
@@ -194,43 +207,49 @@ __global__ void reduce_min_max_kernel(const float* const d_in, float* const d_mi
 
 __global__ void histogram_local_reduce_atomic(const float* const d_logLuminance,
                                                 unsigned int* const d_histogram,
-                                                unsigned int* const d_buf, // numBins * length
                                                 const float min_logLum,
                                                 const float max_logLum,
-                                                const float range_logLum,
                                                 const size_t length,
                                                 const size_t numBins) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int tid = threadIdx.x;
-    int n = blockDim.x;
+    //int n = blockDim.x;
+    float range_logLum = max_logLum - min_logLum;
 
     extern __shared__ __align__(sizeof(unsigned int)) unsigned char smem[];
-    unsigned int *sdata = reinterpret_cast<unsigned int *>(smem); // size should be n
+    unsigned int *sdata = reinterpret_cast<unsigned int *>(smem); // size should be numBins
 
-    for (int i=idx; i<length; i += gridDim.x * blockDim.x) {
-        int bin = (d_logLuminance[i] - min_logLum) / range_logLum * numBins;
-        d_buf[bin * length + idx] += 1;
+    for(int i=tid; i<numBins; i += blockDim.x) {
+        sdata[i] = 0;
     }
     __syncthreads();
 
-    for (int i=0; i<numBins; ++i) {
-        
-        sdata[tid] = d_buf[i * n + tid];
-        __syncthreads();
-        unsigned int r = reduce_shared< unsigned int, addF<unsigned int> >(sdata, n);
-        atomicAdd(&d_histogram[i], r);
+    for (int i=idx; i<length; i += gridDim.x * blockDim.x) {
+        int bin = minF<unsigned int>()(static_cast<unsigned int>((d_logLuminance[i] - min_logLum) / range_logLum * numBins), static_cast<unsigned int>(numBins-1));
+        //d_buf[bin * length + idx] += 1;
+        atomicAdd(&sdata[bin], 1);
     }
+
+    __syncthreads();
+    for(int i=tid; i<numBins; i += blockDim.x) {
+        atomicAdd(&d_histogram[i], sdata[i]);
+    }
+    //for (int i=0; i<numBins; ++i) {
+    //    __syncthreads();
+    //    sdata[tid] = (idx < length)? d_buf[i * length + idx] : 0;
+    //    __syncthreads();
+    //    unsigned int r = reduce_shared< unsigned int, addF<unsigned int> >(sdata, n);
+    //    if (tid == 0) atomicAdd(&d_histogram[i], r);
+    //}
 }
 
 template<typename T, typename F>
 __global__ void hills_steele_scan_kernel(const T* const d_in, T* const d_out, int length) {
 
-    int offset = blockIdx.x * blockDim.x;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int tid = threadIdx.x;
 
     int n = blockDim.x; // size of one shared mem array
-    int pin = 0, pout = 1;
 
     extern __shared__ __align__(sizeof(T)) unsigned char smem[];
     T *sdata = reinterpret_cast<T *>(smem); // size should be n
@@ -268,7 +287,7 @@ __global__ void blelloch_scan_kernel(T* const d_in, T* const d_out, int length, 
     T *sdata = reinterpret_cast<T *>(smem); // size should be n
     
     sdata[ltid * 2] = (gtid * 2 < length)? d_in[gtid * 2] : identity;
-    sdata[ltid * 2 + 1] = (gtid * 2 + 1< length)? d_in[gtid * 2] : identity;
+    sdata[ltid * 2 + 1] = (gtid * 2 + 1< length)? d_in[gtid * 2 + 1] : identity;
     __syncthreads();
 
     int s = 2;
@@ -283,13 +302,13 @@ __global__ void blelloch_scan_kernel(T* const d_in, T* const d_out, int length, 
     }
 
     if (ltid == 0) {
-        d_out[blockIdx.x] = sdata[n-1];
+        if(d_out) d_out[blockIdx.x] = sdata[n-1];
         sdata[n - 1] = identity; // identity item
     }
     __syncthreads();
     
     s = n;
-    for (; s > 1; s >>= 2) {
+    for (; s > 1; s >>= 1) {
         int pos = ltid * s + s - 1;
         if (pos < n) {
             T a = sdata[pos - s/2];
@@ -344,55 +363,131 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
+
     int length = numRows * numCols;
 
-    int blockSize = 256;
+    int blockSize = 512;
     int gridSize = (length + blockSize - 1)/blockSize;
     
     float* d_buf1;
     unsigned int* d_buf2;
+
+#if DEBUG == 1
+    struct timeval tb, te;
+    gettimeofday(&tb, 0);
+#endif    
     checkCudaErrors(cudaMalloc((void **)&d_buf1, length * sizeof(float)));
-    checkCudaErrors(cudaMalloc((void **)&d_buf2, numBins * length * sizeof(unsigned int)));
-    checkCudaErrors(cudaMemset(d_buf2, 0, numBins * length * sizeof(unsigned int)));
+    checkCudaErrors(cudaMalloc((void **)&d_buf2, numBins * sizeof(unsigned int)));
+    checkCudaErrors(cudaMemset(d_buf2, 0, numBins * sizeof(unsigned int)));
    
+#if DEBUG == 1
+    cudaDeviceSynchronize();
+    gettimeofday(&te, 0);
+    printf("memset time: %ld\n", (te.tv_sec-tb.tv_sec)*1000000 + te.tv_usec-tb.tv_usec);
+#endif    
+
     // find min_logLum
+#if DEBUG == 1
+    printf("reduce_min: grid: %d, block: %d, length: %d\n", gridSize, blockSize, length);
+    gettimeofday(&tb, 0);
+#endif    
+
     reduce_kernel< float, minF<float> ><<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_logLuminance, d_buf1, 275.0, length);
     checkCudaErrors(cudaGetLastError());
 
     int gs = gridSize;
     while(gs > 1) {
+        int l = gs;
         gs = (gs+blockSize-1)/blockSize;
-        reduce_kernel<float, minF<float> ><<<gs, blockSize, blockSize * sizeof(float)>>>(d_buf1, d_buf1, 275.0, gs);
+        printf("reduce_min: grid: %d, block: %d, length: %d\n", gs, blockSize, l);
+        reduce_kernel<float, minF<float> ><<<gs, blockSize, blockSize * sizeof(float)>>>(d_buf1, d_buf1, 275.0, l);
         checkCudaErrors(cudaGetLastError());
     }
+#if DEBUG == 1
+    cudaDeviceSynchronize();
+    gettimeofday(&te, 0);
+    printf("reduce min time: %ld\n", (te.tv_sec-tb.tv_sec)*1000000 + te.tv_usec-tb.tv_usec);
+#endif    
 
-    min_logLum = d_buf1[0];
+    checkCudaErrors(cudaMemcpy(&min_logLum, d_buf1, sizeof(float), cudaMemcpyDeviceToHost));
+    printf("min_logLum = %f\n", min_logLum);
     
     // find max logLum
+#if DEBUG == 1
+    printf("reduce_max: grid: %d, block: %d, length: %d\n", gridSize, blockSize, length);
+    gettimeofday(&tb, 0);
+#endif    
+
     reduce_kernel<float, maxF<float> ><<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_logLuminance, d_buf1, 0.0, length);
     checkCudaErrors(cudaGetLastError());
 
     gs = gridSize;
     while(gs > 1) {
+        int l = gs;
         gs = (gs+blockSize-1)/blockSize;
-        reduce_kernel<float, maxF<float> ><<<gs, blockSize, blockSize * sizeof(float)>>>(d_buf1, d_buf1, 0.0, gs);
+        printf("reduce_max: grid: %d, block: %d, length: %d\n", gs, blockSize, l);
+        reduce_kernel<float, maxF<float> ><<<gs, blockSize, blockSize * sizeof(float)>>>(d_buf1, d_buf1, 0.0, l);
         checkCudaErrors(cudaGetLastError());
     }
 
-    max_logLum = d_buf1[0];
+#if DEBUG == 1
+    cudaDeviceSynchronize();
+    gettimeofday(&te, 0);
+    printf("reduce max time: %ld\n", (te.tv_sec-tb.tv_sec)*1000000 + te.tv_usec-tb.tv_usec);
+#endif    
+
+    checkCudaErrors(cudaMemcpy(&max_logLum, d_buf1, sizeof(float), cudaMemcpyDeviceToHost));
+    printf("max_logLum = %f\n", max_logLum);
 
     // compute histogram
     gridSize = (length + blockSize - 1)/blockSize;
-    histogram_local_reduce_atomic<<<gridSize, blockSize, blockSize * sizeof(unsigned int)>>>(d_logLuminance, d_cdf, d_buf2, min_logLum, max_logLum, max_logLum - min_logLum, length, numBins);
-    checkCudaErrors(cudaGetLastError());
 
+#if DEBUG == 1
+    printf("histogram: grid: %d, block: %d, length: %d\n", gridSize, blockSize, length);
+    gettimeofday(&tb, 0);
+#endif    
+
+    histogram_local_reduce_atomic<<<gridSize, blockSize, numBins * sizeof(unsigned int)>>>(d_logLuminance, d_cdf, min_logLum, max_logLum, length, numBins);
+    checkCudaErrors(cudaGetLastError());
+    
+#if DEBUG == 1
+    cudaDeviceSynchronize();
+    gettimeofday(&te, 0);
+    printf("histogram time: %ld\n", (te.tv_sec-tb.tv_sec)*1000000 + te.tv_usec-tb.tv_usec);
+#endif    
+   
     // exclusive scan to produce cdf
+    blockSize = 1024;
     gridSize = (numBins + blockSize - 1)/blockSize;
     assert(gridSize <= blockSize);
+
+#if DEBUG == 1
+    printf("scan: grid: %d, block: %d, length: %lu\n", gridSize, blockSize, numBins);
+    gettimeofday(&tb, 0);
+#endif    
+
     blelloch_scan_kernel<unsigned int, addF<unsigned int> ><<<gridSize, blockSize, blockSize * 2 * sizeof(unsigned int)>>>(d_cdf, d_buf2, numBins, 0);
     checkCudaErrors(cudaGetLastError());
     
-    scan_update_kernel<unsigned int, addF<unsigned int> ><<<1, blockSize>>>(d_cdf, d_buf2, numBins);
-    checkCudaErrors(cudaGetLastError());
-
+    if (gridSize > 1) {
+#if DEBUG == 1
+        printf("scan: grid: %d, block: %d, length: %d\n", (gridSize+blockSize-1)/blockSize, blockSize, gridSize);
+#endif    
+        blelloch_scan_kernel<unsigned int, addF<unsigned int> ><<<(gridSize+blockSize-1)/blockSize, blockSize, blockSize * 2 * sizeof(unsigned int)>>>(d_buf2, NULL, gridSize, 0);
+        checkCudaErrors(cudaGetLastError());
+#if DEBUG == 1
+        printf("scan_update: grid: %d, block: %d\n", gridSize, blockSize);
+#endif    
+        scan_update_kernel<unsigned int, addF<unsigned int> ><<<gridSize, blockSize>>>(d_cdf, d_buf2, numBins);
+        checkCudaErrors(cudaGetLastError());
+    }
+    
+#if DEBUG == 1
+    cudaDeviceSynchronize();
+    gettimeofday(&te, 0);
+    printf("scan time: %ld\n", (te.tv_sec-tb.tv_sec)*1000000 + te.tv_usec-tb.tv_usec);
+#endif    
+    
+    checkCudaErrors(cudaFree(d_buf1));
+    checkCudaErrors(cudaFree(d_buf2));
 }
