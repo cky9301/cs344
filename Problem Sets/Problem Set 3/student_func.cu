@@ -399,7 +399,9 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     while(gs > 1) {
         int l = gs;
         gs = (gs+blockSize-1)/blockSize;
+#if DEBUG == 1
         printf("reduce_min: grid: %d, block: %d, length: %d\n", gs, blockSize, l);
+#endif    
         reduce_kernel<float, minF<float> ><<<gs, blockSize, blockSize * sizeof(float)>>>(d_buf1, d_buf1, 275.0, l);
         checkCudaErrors(cudaGetLastError());
     }
@@ -425,7 +427,9 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     while(gs > 1) {
         int l = gs;
         gs = (gs+blockSize-1)/blockSize;
+#if DEBUG == 1
         printf("reduce_max: grid: %d, block: %d, length: %d\n", gs, blockSize, l);
+#endif    
         reduce_kernel<float, maxF<float> ><<<gs, blockSize, blockSize * sizeof(float)>>>(d_buf1, d_buf1, 0.0, l);
         checkCudaErrors(cudaGetLastError());
     }
